@@ -1,0 +1,268 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <ArduinoJson.h>
+#include <Adafruit_PN532.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPSPlus.h>
+#include "time.h"
+
+/*** WiFi ***/
+const char* WIFI_SSID = "EKA";
+const char* WIFI_PASS = "12345678";
+
+/*** Google Apps Script WebApp URL ***/
+const char* WEBAPP_URL = "https://script.google.com/macros/s/AKfycbzyR9kT31cqEF-T6BiZNi9vVmoLT6E0qLjb70g3HbTzXsXB9KdfitRI-LgrM1X25sDv/exec";
+
+/*** NTP ***/
+const char* ntpServer = "pool.ntp.org";
+const long   gmtOffset_sec = 19800; // +5:30
+const int    daylightOffset_sec = 0;
+
+/*** I2C ***/
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+/*** PN532 (I2C) ***/
+#define PN532_IRQ   2
+#define PN532_RESET 3
+Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET, &Wire);
+
+/*** MPU6050 (I2C addr 0x69) ***/
+Adafruit_MPU6050 mpu;
+
+/*** GPS (UART1) ***/
+HardwareSerial SerialGPS(1);
+#define GPS_RX 16
+#define GPS_TX 17
+TinyGPSPlus gps;
+
+/*** Buzzer ***/
+#define BUZZER_PIN 4
+void buzz(uint16_t ms=120){ digitalWrite(BUZZER_PIN, HIGH); delay(ms); digitalWrite(BUZZER_PIN, LOW); }
+
+/*** State ***/
+struct State {
+  bool loggedIn = false;
+  bool onBreak  = false;
+  String uid = "";
+
+  // break
+  unsigned long breakStartMs = 0;
+  int totalBreakMinToday = 0;
+} S;
+
+unsigned long lastMotionMs = 0;
+bool inIdleBlock = false;
+
+const unsigned long IDLE_WINDOW_MS = 10UL*60UL*1000UL; // 10 min
+const float GYRO_SUM_THRESH = 0.2f; // tune
+const float FREEFALL_G = 0.25f;     // m/s^2 approx near 0
+const float IMPACT_G   = 30.0f;     // m/s^2 large spike
+
+/*** Helpers ***/
+void wifiEnsure() {
+  if (WiFi.status()==WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi connecting");
+  while (WiFi.status()!=WL_CONNECTED){ delay(400); Serial.print("."); }
+  Serial.println(" connected!");
+}
+
+String nowISO() {
+  struct tm t;
+  if (!getLocalTime(&t)) return "";
+  char buf[25];
+  strftime(buf,sizeof(buf), "%Y-%m-%dT%H:%M:%S", &t);
+  return String(buf);
+}
+
+bool getGPSFix(double &lat, double &lon, unsigned long budget=1500){
+  unsigned long t0=millis();
+  while (millis()-t0 < budget){
+    while (SerialGPS.available()) gps.encode(SerialGPS.read());
+    if (gps.location.isValid()) { lat=gps.location.lat(); lon=gps.location.lng(); return true; }
+  }
+  return false;
+}
+
+bool getWiFiIPGeo(double &lat, double &lon){
+  if (WiFi.status()!=WL_CONNECTED) return false;
+  HTTPClient http;
+  http.begin("http://ip-api.com/json");
+  int code=http.GET();
+  if (code==200){
+    DynamicJsonDocument d(1024);
+    if (!deserializeJson(d, http.getString())){
+      if (String(d["status"])=="success"){ lat=d["lat"].as<double>(); lon=d["lon"].as<double>(); http.end(); return true; }
+    }
+  }
+  http.end();
+  return false;
+}
+
+bool bestLocation(double &lat, double &lon){
+  if (getGPSFix(lat,lon)) return true;
+  if (getWiFiIPGeo(lat,lon)) return true;
+  return false;
+}
+
+bool postJSON(const JsonDocument &doc){
+  wifiEnsure();
+  String payload; serializeJson(doc,payload);
+  HTTPClient http;
+  http.begin(WEBAPP_URL);
+  http.addHeader("Content-Type","application/json");
+  int code=http.POST(payload);
+  Serial.printf("POST -> %d  %s\n", code, payload.c_str());
+  if (code>0) Serial.println(http.getString());
+  http.end();
+  return code==200;
+}
+
+/*** Event posts ***/
+void postEvent(const char* mode, int durationMin=0, double lat=0, double lon=0){
+  DynamicJsonDocument j(512);
+  j["uid"]   = S.uid;
+  j["mode"]  = mode;
+  j["ts_iso"]= nowISO();
+  if (durationMin>0) j["duration_mins"]=durationMin;
+  if (lat!=0 || lon!=0){ j["lat"]=lat; j["lon"]=lon; }
+  postJSON(j);
+}
+
+/*** PN532 UID read once ***/
+bool readCardOnce(String &outUID, uint8_t &uidLen, uint8_t uid[7]){
+  if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 30)){
+    String s="";
+    for (uint8_t i=0;i<uidLen;i++){ if (uid[i]<0x10) s+='0'; s+=String(uid[i],HEX); }
+    s.toUpperCase();
+    outUID = s;
+    return true;
+  }
+  return false;
+}
+
+/*** Setup ***/
+void setup(){
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  wifiEnsure();
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  // PN532
+  nfc.begin();
+  uint32_t v = nfc.getFirmwareVersion();
+  if (!v){ Serial.println("PN532 not found"); while(1){ delay(500);} }
+  nfc.SAMConfig();  // I2C normal mode
+
+  // MPU6050 @ 0x69
+  if (!mpu.begin(0x69)){ Serial.println("MPU6050 (0x69) not found"); while(1){ delay(500);} }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // GPS
+  SerialGPS.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  lastMotionMs = millis();
+  Serial.println("Init done.");
+  buzz(200);
+}
+
+/*** Loop ***/
+void loop(){
+  // feed GPS parser
+  while (SerialGPS.available()) gps.encode(SerialGPS.read());
+
+  // --- NFC state machine ---
+  String uidStr; uint8_t uidLen=0; uint8_t uid[7];
+  if (readCardOnce(uidStr, uidLen, uid)){
+    buzz(120);
+
+    // HOLD detection: keep sampling while same UID is present; >2s => logout
+    const unsigned long HOLD_MS = 2000;
+    unsigned long seenStart = millis();
+    bool stillPresent = true;
+    while (stillPresent){
+      String u2; uint8_t l2=0; uint8_t b2[7];
+      stillPresent = readCardOnce(u2,l2,b2) && (u2==uidStr);
+      if (!stillPresent) break;
+      if (millis()-seenStart > HOLD_MS) {
+        if (S.loggedIn && S.uid==uidStr){
+          double lat=0,lon=0; bestLocation(lat,lon);
+          S.loggedIn=false; S.onBreak=false;
+          postEvent("logout",0,lat,lon);
+          Serial.printf("LOGOUT: %s\n", uidStr.c_str());
+          buzz(250);
+        }
+        goto sensors; // skip treating as a tap
+      }
+      delay(50);
+    }
+
+    // TAP (not a hold)
+    if (!S.loggedIn){
+      // LOGIN
+      S.loggedIn = true; S.onBreak=false; S.uid=uidStr;
+      double lat=0,lon=0; bestLocation(lat,lon);
+      postEvent("login",0,lat,lon);
+      Serial.printf("LOGIN: %s\n", uidStr.c_str());
+    }
+    else if (S.loggedIn && S.uid==uidStr && !S.onBreak){
+      // BREAK START
+      S.onBreak=true; S.breakStartMs = millis();
+      postEvent("break_start");
+      Serial.println("BREAK START");
+    }
+    else if (S.loggedIn && S.uid==uidStr && S.onBreak){
+      // BREAK END
+      int durMin = (millis() - S.breakStartMs)/60000;
+      if (durMin<0) durMin=0;
+      S.totalBreakMinToday += durMin;
+      S.onBreak=false; S.breakStartMs=0;
+      postEvent("break_end", durMin);
+      Serial.printf("BREAK END: %d min (total today %d)\n", durMin, S.totalBreakMinToday);
+    }
+  }
+
+sensors:
+  // if not working or on break → skip idle/fall
+  if (!S.loggedIn || S.onBreak){ delay(40); return; }
+
+  // Motion/Idle/Fall
+  sensors_event_t a,g,t;
+  mpu.getEvent(&a,&g,&t);
+
+  float gyroSum = fabs(g.gyro.x)+fabs(g.gyro.y)+fabs(g.gyro.z);
+  if (gyroSum > GYRO_SUM_THRESH){
+    lastMotionMs = millis();
+    if (inIdleBlock){ inIdleBlock=false; Serial.println("MOVEMENT: exit idle"); }
+  }
+
+  if (!inIdleBlock && (millis()-lastMotionMs) > IDLE_WINDOW_MS){
+    inIdleBlock = true;
+    postEvent("idle_10");  // server will add +10 min
+    Serial.println("IDLE block posted (10 min)");
+  }
+
+  // fall: near-freefall then impact
+  float mag2 = a.acceleration.x*a.acceleration.x + a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z;
+  if (mag2 < (FREEFALL_G*FREEFALL_G)){
+    delay(120);
+    mpu.getEvent(&a,&g,&t);
+    float mag = sqrt(a.acceleration.x*a.acceleration.x + a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z);
+    if (mag > IMPACT_G){
+      double lat=0,lon=0; bestLocation(lat,lon);
+      postEvent("fall",0,lat,lon);
+      Serial.println("FALL DETECTED!");
+      buzz(500);
+      delay(350);
+    }
+  }
+
+  delay(30);
+}
